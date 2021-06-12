@@ -1,0 +1,583 @@
+
+# PACKAGES
+
+requiredPackages <- c('rjson', 'geojsonio', 'osmdata', 'tidyverse', 'sf', 'sp', 'hddtools', 'rgeos', 'raster', 'lwgeom', 'units', 'gtools', 'reshape2', 
+              'openxlsx', 'tigris', 'broom', 'viridis', 'gridExtra', 'corrplot', 'psych', 'RColorBrewer', 'scales', 'cowplot')
+
+for (i in requiredPackages) {
+  if (!require(i,character.only = T)) {
+    install.packages(i)
+  }
+}
+
+for (i in requiredPackages) {
+  if (!require(i,character.only = T)) {
+    library(i,character.only = T)
+  }
+}
+
+
+# INITIAL SET-UP
+
+rm(list=ls())
+setwd('/Users/Szymon/Desktop/UNI/Mag/Master Thesis/R Codes/MasterTheesis/')
+
+panel <- read.xlsx('data/csv/suburbanisation.xlsx')
+
+
+# BOROUGHS OSM RELATION IDs
+
+  # COUNTIES
+links <- (unique(paste('gmina%20', panel$borough, '%2C%20powiat%20', panel$county, sep='')))
+boroughs_osm <- data.frame(borough=character(), county=character(), osm_id=integer(), stringsAsFactors = F)
+
+for (i in (1:length(links))) {
+  boroughs_osm[i,'borough'] <- substr(links[i],9,gregexpr('%20', links[i])[[1]][2]-4)
+  boroughs_osm[i,'county'] <- substr(links[i],gregexpr('%20', links[i])[[1]][3]+3,100)
+  download.file(url=paste('https://nominatim.openstreetmap.org/search?q=', links[i],'&format=json', sep=''),
+                destfile = 'data/json/osm_id.json')
+  osm_id <- fromJSON(file = 'data/json/osm_id.json')
+  if (length(osm_id)==0) {
+    boroughs_osm[i,'osm_id'] <- NA
+  }
+  else {
+    boroughs_osm[i,'osm_id'] <- osm_id[[1]]$osm_id
+  }
+  Sys.sleep(runif(1,1,3))
+}
+
+  # CITIES
+boroughs_osm$borough <- as.factor(boroughs_osm$borough)
+boroughs_osm$county <- as.factor(boroughs_osm$county)
+links_na <- (unique(paste(boroughs_osm[is.na(boroughs_osm$osm_id)==T,'borough'], '%2C%20powiat%20', boroughs_osm[is.na(boroughs_osm$osm_id)==T,'county'], sep='')))
+
+for (i in (1:length(links_na))) {
+  download.file(url=paste('https://nominatim.openstreetmap.org/search?q=', links_na[i],'&format=json', sep=''),
+                destfile = 'data/json/osm_id.json')
+  osm_id <- fromJSON(file = 'data/json/osm_id.json')
+  if (length(osm_id)==0) {
+    boroughs_osm[boroughs_osm$borough==substr(links_na[i],1,gregexpr('%20', links_na[i])[[1]][2]-4),'osm_id'] <- NA
+  }
+  else {
+    boroughs_osm[boroughs_osm$borough==substr(links_na[i],1,gregexpr('%20', links_na[i])[[1]][1]-4),'osm_id'] <- osm_id[[1]]$osm_id
+  }
+  Sys.sleep(runif(1,1,2))
+}
+
+  # NAs (Podkowa Leśna -> powiat grodziski, not pruszkowski?)
+download.file(url=paste('https://nominatim.openstreetmap.org/search?q=Podkowa Leśna%2C%20powiat%20grodziski&format=json', sep=''),
+              destfile = 'data/json/osm_id.json')
+osm_id <- fromJSON(file = 'data/json/osm_id.json')
+boroughs_osm[boroughs_osm$borough=='Podkowa Leśna','osm_id'] <- osm_id[[1]]$osm_id
+
+write.csv2(boroughs_osm, file='data/csv/boroughs_osm.csv')
+
+
+# DOWNLOAD LOCATION POLYGONS AND BUILDINGS AND ROADS WITHIN
+
+boroughs_osm <- read.csv('data/csv/boroughs_osm.csv', sep=';')
+
+  # define function to trim osm data when there are multiple bounding polygons (e.g. borough Brwinów)
+trim_osmdata_mltpl <- function(data, bbox, exclude=T) {
+    # extract polygons from Spatial DataFrame
+  polygons <- bbox@polygons[[1]]@Polygons
+  
+    # check if there are multiple and process accordingly
+  for (pol in loc_sp@polygons[[1]]@Polygons) {
+    res_tmp <- trim_osmdata(data, pol@coords, exclude)
+    if (! exists('res')) {
+      res <- res_tmp
+    } else {
+      res <- c(res, res_tmp)
+    }
+  }
+  return(res)
+}
+
+  # accomodation building type (also keeping 'yes' as it's a very common value)
+bldgs_tp = c('apartments', 'bungalow', 'cabin', 'detached', 'dormitory', 'farm', 'house', 'residential', 'semidetached_house', 'terrace', 'yes')
+  # highway types
+hghws_tp <- c('motorway', 'trunk', 'primary', 'secondary', 'tertiary', 'unclassified', 'residential', 'living_street', 'road')
+  # large highway types
+hghws_tp_lrg <- c('motorway', 'trunk', 'primary', 'secondary', 'tertiary')
+
+# for (borough in boroughs_osm[, 2]) {
+#   # remove locs, bldgs, hghws in first iteration and set counter
+#   if (borough == 'Baranów') {
+#     try(rm(locs, bldgs, hghws))
+#     i <- 1
+#   }
+#   
+#   # extract borough polygon and bounding box
+#   loc <- opq_osm_id(id=boroughs_osm[boroughs_osm$borough==borough,'osm_id'], type='relation') %>%
+#     opq_string () %>%
+#     osmdata_sf()
+#   loc$osm_multipolygons$borough = borough
+#   loc_sp <- as(loc$osm_multipolygons, 'Spatial')
+#   loc_bb <- loc_sp@bbox
+#   locs <- ifelse(exists('locs'), c(locs, loc), loc)
+#   
+#   # extract buildings within the borough
+#   bldg <- opq(bbox = loc_bb) %>%
+#     add_osm_feature(key = 'building', value = bldgs_tp) %>%
+#     osmdata_sf()  %>%
+#     trim_osmdata_mltpl(., loc_sp, F)
+#   bldg$osm_polygons$borough = borough
+#   bldgs <- ifelse(exists('bldgs'), c(bldgs, bldg), bldg)
+#   
+#   # extract highways within the borough
+#   hghw <- opq(bbox = loc_bb) %>%
+#     add_osm_feature(key = 'highway', value = hghws_tp) %>%
+#     osmdata_sf() %>%
+#     trim_osmdata_mltpl(., loc_sp, F)
+#   hghw$osm_lines$borough = borough
+#   hghws <- ifelse(exists('hghws'), c(hghws, hghw), hghw)
+#   
+#   # progress 
+#   cat(round(100* i/nrow(boroughs_osm), 2), '% done!', '\n')
+#   i <- i + 1
+#   
+#   # remove i and borough and save RDS files after last iteration
+#   if (i == nrow(boroughs_osm)+1) {
+#     rm(borough, i)
+#     saveRDS(locs, 'data/shp/locs.RDS')
+#     saveRDS(bldgs, 'data/shp/bldgs.RDS')
+#     saveRDS(hghws, 'data/shp/hghws.RDS')
+#   }
+# }
+
+  # load saved files due to long computation time
+locs <- readRDS('data/shp/locs.RDS')
+bldgs <- readRDS('data/shp/bldgs.RDS')
+hghws <- readRDS('data/shp/hghws.RDS')
+
+  # select only large highways
+hghws_lrg <- hghws$osm_lines[hghws$osm_lines$highway %in% hghws_tp_lrg,]
+
+
+# PLOT POLYGONS
+
+  # function to plot boroughs_osm
+plot_loc <- function(borough = 'all', l=T, b=T, h=T, hl=T) {
+    # create spatial object for loc, bldgs, hghws based on selection go borough
+  if (borough=='all') {
+    locs_sp <- as(locs$osm_multipolygon, 'Spatial')
+    bldgs_sp <- as(bldgs$osm_polygons, 'Spatial')
+    hghws_sp <- as(hghws$osm_lines, 'Spatial')
+    hghws_lrg_sp <- as(hghws_lrg, 'Spatial')
+  } else if (class(borough) == 'character') {
+    locs_sp <- as(locs$osm_multipolygon[locs$osm_multipolygon$borough %in% borough,], 'Spatial')
+    bldgs_sp <- as(bldgs$osm_polygons[bldgs$osm_polygons$borough %in% borough,], 'Spatial')
+    hghws_sp <- as(hghws$osm_lines[hghws$osm_lines$borough %in% borough,], 'Spatial')
+    hghws_lrg_sp <- as(hghws_lrg[hghws_lrg$borough %in% borough,], 'Spatial')
+  } else if (class(borough) == 'numeric') {
+    locs_sp <- as(locs$osm_multipolygon[borough,], 'Spatial')
+    bldgs_sp <- as(bldgs$osm_polygons[borough,], 'Spatial')
+    hghws_sp <- as(hghws$osm_lines[borough,], 'Spatial')
+    hghws_lrg_sp <- as(hghws_lrg[borough,], 'Spatial')
+  }
+    # plot
+  ggplot() +
+  {if (l) geom_polygon(data = locs_sp, aes(x=long, y=lat, group=group), fill=NA, colour='red', size=1)} +
+  {if (b) geom_polygon(data = bldgs_sp, aes(x=long, y=lat, group=group), fill = 'blue')} +
+  {if (h) geom_line(data = hghws_sp, aes(x=long, y=lat, group=group), colour='#C0C0C0')} +
+  {if (hl) geom_line(data = hghws_lrg_sp, aes(x=long, y=lat, group=group), colour='#696969')} +
+    theme_bw() +
+    theme(
+      plot.background = element_blank(),
+      panel.grid.major = element_blank(),
+      panel.grid.minor = element_blank(),
+      panel.border = element_blank()
+    ) +
+    coord_fixed()
+}
+  # plot
+plot_loc('Baranów')
+
+
+# CALCULATE BUILDING-TO-BUILDING DISTANCE & METROPOLITAN DENSITY & BUILDING-TO-HIGHWAY DISTANCE
+
+# columns that would be filled only for non-residential buildings
+bldgs_na_cols <- c('abandoned.building', 'aeroway', 'amenity', 'atm', 'automated', 'barrier', 'beds', 'bench', 'bicycle_parking', 'brand', 'brewery', 'camp_site', 'car_wash', 'castle_type', 'clothes',
+                   'community_centre', 'construction', 'cuisine', 'deanery', 'delivery', 'demolished.building', 'denomination', 'diaper', 'diocese', 'disabled.amenity', 'dispensing', 'disused', 'drive_through',
+                   'emergency', 'fee', 'government', 'guest_house', 'healthcare', 'heritage', 'highway', 'historic', 'historical', 'horse', 'Kancelaria', 'leisure', 'memorial', 'microbrewery', 'military', 'museum',
+                   'natural', 'office', 'public_transport', 'railway', 'rooms', 'ruin', 'ruins', 'second_hand', 'self_service', 'service', 'shelter', 'shelter_type', 'shop', 'shop_1', 'social_facility', 
+                   'social_facility.for', 'sport', 'street_cabinet', 'takeaway', 'telecom', 'toilets', 'tourism', 'trade', 'wholesale')
+
+metrics <- data.frame(borough = locs_osm$borough)
+
+# for (borough in metrics[, 'borough']) {
+#   
+#   # set counter
+#   if (borough==metrics[1, 'borough']) {i <- 1}
+#   
+#   # building-to-building distance
+#   # filter data
+#   bldgs_borough <- bldgs$osm_polygons %>%
+#     filter_at(bldgs_na_cols, all_vars(is.na(.))) %>%
+#     filter(borough == (!! borough))
+#   # centroids
+#   bldgs_borough_cent <- as(
+#     st_centroid(
+#       st_geometry(
+#         st_transform(
+#           bldgs_borough,
+#           crs = 2180))),
+#     'Spatial')
+#   # building-to-building min distance matrix
+#   bldgs_borough_dist_mat <- gDistance(bldgs_borough_cent, byid = T)
+#   bldgs_borough_dist_min <- apply(bldgs_borough_dist_mat, 1, function(x) {min(x[x > 0])})
+#   # metrics
+#   metrics[metrics$borough==borough, 'bldgs_dist_mean'] <- mean(bldgs_borough_dist_min)
+#   metrics[metrics$borough==borough, 'bldgs_dist_median'] <- median(bldgs_borough_dist_min)
+#   metrics[metrics$borough==borough, 'bldgs_dist_min'] <- min(bldgs_borough_dist_min)
+#   metrics[metrics$borough==borough, 'bldgs_dist_max'] <- max(bldgs_borough_dist_min)
+#   metrics[metrics$borough==borough, 'bldgs_dist_sd'] <- sd(bldgs_borough_dist_min)
+#   
+#   # Metropolitan Density (MD): DU or RP (...) divided by total land area [LIT]
+#   MD <- length(bldgs_borough_cent) / set_units(st_area(locs$osm_multipolygons[locs$osm_multipolygons$gmina %in% borough,]), km^2)
+#   metrics[metrics$borough==borough, 'MD'] <- MD
+#   
+#   # building-to-highway distance
+#   # highways with correct CRS
+#   hghws_lrg_borough <- as(
+#     st_transform(
+#       hghws_lrg[hghws_lrg$gmina %in% borough,], 
+#       crs = 2180), 
+#     'Spatial')
+#   # house-to-highway min distance matrix
+#   bldgs_hghws_borough_dist_mat <- gDistance(bldgs_borough_cent, hghws_lrg_borough, byid = T)
+#   bldgs_hghws_borough_dist_min <- apply(bldgs_hghws_borough_dist_mat, 2, function(x) {min(x[x > 0])})
+#   # metrics
+#   metrics[metrics$borough==borough, 'bldgs_hghws_dist_mean'] <- mean(bldgs_hghws_borough_dist_min)
+#   metrics[metrics$borough==borough, 'bldgs_hghws_dist_median'] <- median(bldgs_hghws_borough_dist_min)
+#   metrics[metrics$borough==borough, 'bldgs_hghws_dist_min'] <- min(bldgs_hghws_borough_dist_min)
+#   metrics[metrics$borough==borough, 'bldgs_hghws_dist_max'] <- max(bldgs_hghws_borough_dist_min)
+#   metrics[metrics$borough==borough, 'bldgs_hghws_dist_sd'] <- sd(bldgs_hghws_borough_dist_min)
+#   
+#   # extract borough polygon and bounding box
+#   borough_sp <- as(locs$osm_multipolygon[locs$osm_multipolygon$gmina %in% borough,], 'Spatial')
+#   borough_bb <- borough_sp@bbox
+#   
+#   # find shops
+#   shop <- opq(bbox = borough_bb) %>%
+#     add_osm_feature(key = 'shop') %>%
+#     osmdata_sf()  %>%
+#     trim_osmdata_mltpl(., borough_sp, F)
+#   
+#   # find toursit sites
+#   trsm <- opq(bbox = borough_bb) %>%
+#     add_osm_feature(key = 'tourism') %>%
+#     osmdata_sf()  %>%
+#     trim_osmdata_mltpl(., borough_sp, F)
+#   
+#   # find leisure sites
+#   lsr <- opq(bbox = borough_bb) %>%
+#     add_osm_feature(key = 'leisure') %>%
+#     osmdata_sf()  %>%
+#     trim_osmdata_mltpl(., borough_sp, F)
+#   
+#   # find sport sites
+#   sprt <-  opq(bbox = borough_bb) %>%
+#     add_osm_feature(key = 'sport') %>%
+#     osmdata_sf()  %>%
+#     trim_osmdata_mltpl(., borough_sp, F)
+#   
+#   # find places of worship
+#   amnts <-  opq(bbox = borough_bb) %>%
+#     add_osm_feature(key = 'amenity') %>%
+#     osmdata_sf()  %>%
+#     trim_osmdata_mltpl(., borough_sp, F)
+#   
+#   # append results to metrics
+#   metrics[metrics$borough==borough, 'shops_cnt'] <- nrow(shop$osm_polygons) + nrow(shop$osm_points)
+#   metrics[metrics$borough==borough, 'tourist_sites_cnt'] <- nrow(trsm$osm_polygons) + nrow(trsm$osm_points)
+#   metrics[metrics$borough==borough, 'leisure_sites_cnt'] <- nrow(lsr$osm_polygons) + nrow(lsr$osm_points)
+#   metrics[metrics$borough==borough, 'sport_sites_cnt'] <- nrow(sprt$osm_polygons) +  nrow(sprt$osm_points)
+#   metrics[metrics$borough==borough, 'worship_sites_cnt'] <- nrow(amnts$osm_polygons[na.replace(amnts$osm_polygons$amenity == 'place_of_worship', F),]) + nrow(amnts$osm_points[na.replace(amnts$osm_points$amenity == 'place_of_worship', F),])
+#   metrics[metrics$borough==borough, 'restaurants_cnt'] <- nrow(amnts$osm_polygons[na.replace(amnts$osm_polygons$amenity %in% rstrnt_types, F),]) + nrow(amnts$osm_points[na.replace(amnts$osm_points$amenity %in% rstrnt_types, F),])
+#   
+#   # print progress
+#   cat(round(100* i/length(locs), 2), '% done! \n')
+#   i <- i+1
+#   
+#     if (i == nrow( metrics[, 'borough'])+1) {
+#       rm(borough, i)
+#       write.csv(metrics, 'data/csv/metrics.RDS')
+#     }
+# }
+# 
+# 
+# # CALCULATE MIN DRIVING DISTANCE AND TIME FROM THE BOROUGH'S CENTRE TO WARSAW CENTRAL STATION
+# 
+# for (borough in metrics[, 'borough']) {
+#   
+#   if (borough==boroughs[1]) {i <- 1}
+#   
+#   # select borough's polygon and mao to correct CRS
+#   loc_sp <- locs$osm_multipolygon[locs$osm_multipolygon$gmina %in% borough,]
+#   cent <- coordinates(
+#     as(
+#       st_transform(
+#         st_centroid(
+#           st_geometry(
+#             st_transform(
+#               loc_sp,
+#               crs = 2180))),
+#         crs= "+proj=longlat +datum=WGS84 +units=m +no_defs"),
+#       'Spatial')
+#   )
+#   
+#   # create URL to send to Google API
+#   cent <- paste(cent[1,2], '+', cent[1,1], sep='')
+#   url <- paste('https://maps.googleapis.com/maps/api/distancematrix/json?origins=', cent, '&destinations=52.228914+21.003233&mode=driving&units=metrics&key=AIzaSyDwp9rZrUXbESAJ1Oeub-ntBBsqDNA5xJk', sep='')
+#   
+#   # read results
+#   json <- rjson::fromJSON(file = url)
+#   
+#   # add result to df
+#   if (json$rows[[1]]$elements[[1]]$status == "ZERO_RESULTS") {
+#     metrics[metrics$borough == borough, 'dist_waw_drive'] <- NA
+#     metrics[metrics$borough == borough, 'time_waw_drive'] <- NA
+#   } else {
+#     metrics[metrics$borough == borough, 'dist_waw_drive'] <- json$rows[[1]]$elements[[1]]$distance$value
+#     metrics[metrics$borough == borough, 'time_waw_drive'] <- json$rows[[1]]$elements[[1]]$duration$value
+#   }
+#   
+#   if (i == nrow(metrics[, 'borough'])+1) {
+#     rm(borough, i)
+#     metrics$dist_waw_drive <- metrics$dist_waw_drive/1000
+#     write.csv(metrics, 'data/csv/metrics.csv', row.names = F)
+#   }
+# }
+
+
+metrics <- read.csv('data/csv/metrics.csv', sep=',')
+
+
+# LOAD MIN TIMES OF TRANSIT FROM THE BOROUGH'S CENTRE TO WARSAW CENTRAL STATION AND MERGE ALL RESULTS
+# Transit times were calucalted based on results from e-podroznik.pl for most of the boroughs. 
+# The missing ones were filled based on multiple sources (depending on a borough)
+
+  # load data
+min_times <- read.xlsx('data/csv/boroughs_mt.xlsx')
+
+  # merge dataframes
+panel_metrics <- merge(merge(panel, metrics, by='borough'), min_times[, c(1,3)], by='borough')
+panel_metrics$time_waw_drive <- round(panel_metrics$time_waw_drive/60, 2)
+
+
+# LOAD PARCEL PRICES
+# Prices were scraped from gratka.pl
+
+  # load data
+gratka <- read.csv('data/csv/offers.csv', sep=',')
+
+  # filter the data and create numeric columns
+gratka <- gratka %>%
+  filter(
+    price.PLN. != 'Zapytajocenę',
+    price.PLN. != '',
+    size.m2. != ''
+  ) %>%
+  mutate(
+    borough = as.factor(borough),
+    price = as.numeric(str_replace(price.PLN., ',', '.')),
+    size =  as.numeric(str_replace(size.m2., ',', '.')),
+    price.m2 = price / size,
+    type_eng = plyr::mapvalues(type, c('dom', 'mieszkanie', 'działka'), c('estate', 'estate', 'parcel'))
+  )
+
+  # calcualte avg and median per type
+gratka_prices <- gratka %>%
+  group_by(borough, type_eng) %>%
+  summarise(
+    n = n(),
+    avg = mean(price.m2, na.rm = T),
+    med = median(price.m2, na.rm = T)
+  ) %>%
+  as.data.frame()
+
+  # check if all boroughs were scraped
+# sort(unique(metrics$borough)[!(unique(metrics$borough)) %in% (unique(gratka$borough))])
+
+  # select top 0.5% per type
+# gratka[gratka[,"type_eng"]=='estate',] %>% top_frac(0.005, price.m2) %>% arrange(desc(price.m2))
+# gratka[gratka[,"type_eng"]=='parcel',] %>% top_frac(0.005, price.m2) %>% arrange(desc(price.m2))
+
+  # select bottom 0.5% per type
+# gratka[gratka[,"type_eng"]=='estate',] %>% top_frac(0.005, -1 * price.m2)
+# gratka[gratka[,"type_eng"]=='parcel',] %>% top_frac(0.005, -1 * price.m2)
+
+  # cast dataframe to required format
+gratka_prices <- dcast(melt(gratka_prices), borough~type_eng + variable, value.var = 'value')
+
+  # filter columns
+gratka_prices <- gratka_prices[, c(1, 5, 6, 7)]
+
+  # create 2 observations for Miński Mazowiecki 1 and 2 (both with same values)
+gratka_prices <- rbind(gratka_prices, gratka_prices[gratka_prices$borough=='Mińsk Mazowiecki',])
+gratka_prices$borough <- as.character(gratka_prices$borough)
+gratka_prices[35, 'borough'] <- 'Mińsk Mazowiecki 1'
+gratka_prices[gratka_prices$borough=='Mińsk Mazowiecki', 'borough'] <- 'Mińsk Mazowiecki 2'
+gratka_prices$borough <- as.factor(gratka_prices$borough)
+
+  # merge dataframes
+panel_metrics <- merge(panel_metrics, gratka_prices, by='borough')
+panel_metrics[, c('X', 'dist_waw_transit', 'time_waw_transit')] <- NULL
+
+panel_metrics <- panel_metrics[, c(2,1,3:45)]
+  
+# save results
+write.xlsx(panel_metrics, 'data/csv/panel_metrics_org.xlsx', fileEncoding = "UTF-8")
+
+# PLOT METRICS ON MAP
+
+  # load data
+locs <- readRDS('data/shp/locs.RDS')
+panel_metrics <- read.xlsx('data/csv/panel_metrics_2.xlsx')
+panel_metrics$check_in_2019 <- ifelse(panel_metrics$check_in_2019==0, 0.5, panel_metrics$check_in_2019)
+
+  # transform data
+locs_sp <- as(locs$osm_multipolygon, 'Spatial')
+panel_metrics <- merge(panel_metrics, locs_sp@data[,c('borough', 'osm_id')], by='borough')
+locs_sp <- tidy(locs_sp)
+locs_sp <- merge(locs_sp, panel_metrics, by.x='id', by.y='osm_id', how=)
+
+
+
+  # plot function
+plot_metrics <- function (var, title, caption, legend, breaks) {
+  var <- enquo(var)
+  ggplot() +
+    geom_polygon(data = locs_sp, aes(x=long, y=lat, group=group, fill=!!var), colour='black', size=1, alpha=0.9) +
+    theme_bw() +
+    theme(
+      plot.background = element_blank(),
+      panel.grid.major = element_blank(),
+      panel.grid.minor = element_blank(),
+      panel.border = element_blank()
+    ) +
+    coord_fixed() +
+    #scale_fill_gradientn(colors = brewer.pal(9, name = 'Greys'), name = legend, breaks = breaks, labels = labels) +
+    scale_fill_viridis(trans = "log1p",
+                       breaks = breaks, labels = breaks
+                       ) +
+    theme_void() +
+    labs(
+      caption = caption,
+      title = title,
+      fill = legend
+      ) +
+    theme(
+      plot.title = element_text(color="#000000", face="bold", size=20, hjust=0),
+      plot.caption = element_text(color="#000000", face="bold", size=12, hjust=1),
+      plot.margin = unit(c(0.5,0.5,0.5,0.5), "cm"),
+      legend.title = element_text(color="#505050", face="bold", size=16, hjust=1),
+      legend.text = element_text(color="#505050", size=12, angle = 0),
+      legend.position = 'bottom'
+      ) +
+    guides(
+      fill = guide_colourbar(
+        ticks.colour = "white", 
+        ticks.linewidth = 1.2, 
+        barwidth=15, 
+        label.position="bottom"))
+  }
+
+
+  # plots
+a <- plot_metrics(check_in_2019, '', 'Data Source: Polish Statistical Office', '# of migrants', c(0, 1, 2, 3, 5, 10, 25, 50, 100, 150, 250, 500, 750))
+b <- plot_metrics(pop_density, '', 'Data Source: Polish Statistical Office', '', c(0, 0.5, 1, 2, 3, 5, 7, 10, 15, 20, 30)) + 
+  labs(fill = expression(bold(paste('# of people / ', km^2))))
+c <- plot_metrics(dist, '', 'Data Source: Google Maps', 'km', c(10, 12, 15, 20, 25, 30, 40, 50))
+d <- plot_metrics(income, '', 'Data Source: Polish Statistical Office', 'ratio', c(0.3, 0.4, 0.5, 0.6, 0.8, 1, 1.25, 1.5, 2))
+
+  # save plots
+png('img/map_check_in.png', width = 3508, height = 2480, res=300); a; dev.off();
+
+png('img/map_pop_density.png', width = 3508, height = 2480, res=300); b; dev.off()
+
+png('img/map_dist.png', width = 3508, height = 2480, res=300); c; dev.off()
+
+png('img/map_income.png', width = 3508, height = 2480, res=300); d; dev.off()
+
+a <- plot_metrics(check_in_2019, 'a) migrants', 'Data Source: Polish Statistical Office', '# of migrants', c(0, 1, 5, 10, 25, 50, 100, 250, 750))
+b <- plot_metrics(pop_density, 'b) population density', 'Data Source: Polish Statistical Office', '', c(0, 0.5, 1, 2, 3, 5, 7, 10, 15, 20, 30)) + 
+  labs(fill = expression(bold(paste('# of people / ', km^2))))
+c <- plot_metrics(dist, 'c) distance', 'Data Source: Google Maps', 'km', c(10, 12, 15, 20, 25, 30, 40, 50))
+d <- plot_metrics(income, 'd) income per capita', 'Data Source: Polish Statistical Office', 'ratio', c(0.3, 0.5, 0.75, 1, 1.25, 1.5, 2))
+
+plot_grid(a, b, c, d, align = 'hv', greedy=F)
+
+png('img/combined_2.png', width = 3508, height = 2480, res=300)
+plot_grid(a, b, c, d, align = 'hv', greedy=F)
+dev.off()
+
+
+# CORRELATION PLOT
+
+panel_metrics <- read.xlsx('data/csv/panel_metrics_2.xlsx')
+
+  # rename columns to match 'official' names
+colnames(panel_metrics)[4] <- 'check_in'
+colnames(panel_metrics)[17] <- 'pop_dens'
+colnames(panel_metrics)[21] <- 'pis'
+colnames(panel_metrics)[22] <- 'ko'
+colnames(panel_metrics)[33] <- 'md'
+colnames(panel_metrics)[34] <- 'shops'
+colnames(panel_metrics)[35] <- 'tourist'
+colnames(panel_metrics)[36] <- 'leisure'
+colnames(panel_metrics)[37] <- 'sport'
+colnames(panel_metrics)[40] <- 'worship'
+colnames(panel_metrics)[41] <- 'restaurant'
+colnames(panel_metrics)[44] <- 'parcel_mean'
+
+  # extract final columns and reorder
+data_model <- panel_metrics[, c(4, 6:9, 10:17, 19:22, 24, 29, 33:42, 43, 44)]
+
+data_model_cols <- c('check_in', 'pop_dens', 'dist', 'income', 'unempl', 'pis', 'ko', 'bu', 'bur', 'br', 'area', 'forest', 'greenery', 'kinder', 'nursery',
+                     'shops', 'tourist', 'leisure', 'sport', 'restaurant', 'worship', 'bldgs_dist_median', 'bldgs_hghws_dist_median', 'md', 'train', 
+                     'dist_waw_drive', 'time_waw_drive', 'min_dur', 'price_m2', 'parcel_n', 'parcel_mean')
+
+data_model <- data_model[, data_model_cols]
+
+  # correlation plot
+data_model_corr <- cor(data_model)
+
+write.xlsx(data_model_corr, 'data/csv/corr.xlsx', row.names=T)
+
+png('img/corr_plot.png', width = 3508, height = 3508, res=300)
+
+corrplot.mixed(
+  corr = data_model_corr,
+  upper = 'color',
+  lower = 'number',
+  upper.col = viridis(n=20),
+  lower.col = 'black',
+  number.cex = 0.7,
+  tl.cex=0.9, 
+  tl.pos='lt',
+  font=3,
+  tl.col = "black"
+)
+
+dev.off()
+
+# PCA
+
+data_model <- panel_metrics[, c(4, 6:9, 10:17, 19:22, 24, 29, 33:42, 43, 44)]
+
+principal(data_model[,-c(1, 5)], 
+          nfactors = 8,
+          rotate = "varimax")
+
+pca <- principal(data_model[,-1], rotate="varimax", nfactors=15, scores=TRUE)
+
+pca <- data.frame(
+  Variable = row.names(pca$Structure),
+  Loading = pca$Structure[,1],
+  Communality = pca$communality, 
+  Uniqueness = pca$uniquenesses)
+
+write.xlsx(pca, 'data/csv/pca.xlsx')
